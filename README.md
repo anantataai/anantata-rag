@@ -1,2 +1,15 @@
-# anantata-rag
-Description: RAG memory + Claude MCP integration for Anantata project
+# Anantata RAG Memory System
+
+Цей репозиторій містить серверну частину системи RAG для проєкту **Anantata**.
+
+## Структура
+- **server/** — основні Python-скрипти для імпорту даних та оновлення RAG.
+- **mcp/** — інтеграція з Claude MCP.
+- **docs/** — технічна документація, інструкції та нотатки.
+- **data/** — службові файли (експорти, кеші тощо, не комітяться).
+
+## Встановлення залежностей
+```bash
+pip install -r requirements.txt
+Автори
+Pavlo Kov
