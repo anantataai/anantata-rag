@@ -1,154 +1,176 @@
+"""
+Модуль для завантаження розмов ChatGPT в Qdrant
+"""
 
-import os
 import json
-from datetime import datetime
+import logging
 from typing import List, Dict, Any
+from datetime import datetime
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 from sentence_transformers import SentenceTransformer
-from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 
 class ChatGPTToQdrant:
-    def __init__(self, qdrant_url: str = None):
-        """
-        Ініціалізація клієнта Qdrant та моделі ембедингів.
-        """
-        load_dotenv()
-
-        self.qdrant_url = qdrant_url or os.getenv("QDRANT_URL", "http://localhost:6333")
-        self.collection_name = os.getenv("QDRANT_COLLECTION", "chatgpt_conversations")
-        self.api_key = os.getenv("QDRANT_API_KEY", None)
-
-        self.client = QdrantClient(url=self.qdrant_url, api_key=self.api_key)
-        self.model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+    """Клас для роботи з RAG базою на Qdrant"""
+    
+    def __init__(self, qdrant_url: str = "http://localhost:6333"):
+        """Ініціалізація"""
+        self.client = QdrantClient(url=qdrant_url)
+        self.model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
         self.vector_size = 384
-
-        print(f"��� Підключено до Qdrant: {self.qdrant_url}")
-        print(f"��� Колекція за замовчуванням: {self.collection_name}")
-
-    def parse_conversation(self, conversation: Dict[str, Any]) -> List[Dict[str, Any]]:
-        messages = []
-        mapping = conversation.get("mapping", {})
-        title = conversation.get("title", "Без назви")
-
-        for node_id, node_data in mapping.items():
-            message = node_data.get("message")
-            if not message:
-                continue
-
-            author = message.get("author", {})
-            role = author.get("role")
-            if role == "system":
-                continue
-
-            content = message.get("content", {})
-            parts = content.get("parts", [])
-            text = " ".join([str(p) for p in parts if p])
-
-            if not text.strip():
-                continue
-
-            create_time = message.get("create_time")
-            timestamp = None
-            if create_time:
-                try:
-                    if 0 < create_time < 2147483647:
-                        timestamp = datetime.fromtimestamp(create_time).isoformat()
-                except Exception:
-                    pass
-
-            messages.append({
-                "id": message.get("id"),
-                "role": role,
-                "text": text.strip(),
-                "conversation_title": title,
-                "timestamp": timestamp
-            })
-        return messages
-
-    def create_chunks(self, messages: List[Dict[str, Any]], chunk_size: int = 2) -> List[Dict[str, Any]]:
-        chunks = []
-        for i in range(0, len(messages), chunk_size):
-            chunk_messages = messages[i:i + chunk_size]
-            combined_text = "\n\n".join([f"{m['role'].upper()}: {m['text']}" for m in chunk_messages])
-            chunks.append({
-                "text": combined_text,
-                "conversation_title": chunk_messages[0]["conversation_title"],
-                "roles": [m["role"] for m in chunk_messages],
-                "timestamp": chunk_messages[0]["timestamp"],
-                "message_ids": [m["id"] for m in chunk_messages]
-            })
-        return chunks
-
-    def create_collection(self, collection_name: str = None):
-        collection_name = collection_name or self.collection_name
+        
+        logger.info(f"Підключено до Qdrant: {qdrant_url}")
+    
+    def ensure_collection(self, collection_name: str):
+        """Створює колекцію якщо не існує"""
         try:
-            self.client.delete_collection(collection_name)
-            print(f"���️ Існуючу колекцію '{collection_name}' видалено.")
-        except Exception:
-            pass
-
-        self.client.create_collection(
-            collection_name=collection_name,
-            vectors_config=VectorParams(size=self.vector_size, distance=Distance.COSINE)
-        )
-        print(f"✅ Створено колекцію '{collection_name}'")
-
-    def load_to_qdrant(self, json_file_path: str, collection_name: str = None):
-        collection_name = collection_name or self.collection_name
-        print(f"��� Завантаження '{json_file_path}'...")
-
-        with open(json_file_path, "r", encoding="utf-8") as f:
-            conversations = json.load(f)
-
-        print(f"��� Знайдено {len(conversations)} розмов.")
-        self.create_collection(collection_name)
-
-        all_chunks = []
-        for idx, conv in enumerate(conversations):
-            msgs = self.parse_conversation(conv)
-            if msgs:
-                all_chunks.extend(self.create_chunks(msgs))
-            if (idx + 1) % 10 == 0:
-                print(f"��� Оброблено {idx + 1}/{len(conversations)}")
-
-        print(f"Всіх чанків: {len(all_chunks)}")
-
-        batch_size = 32
-        for i in range(0, len(all_chunks), batch_size):
-            batch = all_chunks[i:i + batch_size]
-            texts = [ch["text"] for ch in batch]
-            embeddings = self.model.encode(texts, show_progress_bar=False)
-            points = [
-                PointStruct(
-                    id=i + j,
-                    vector=emb.tolist(),
-                    payload={
-                        "text": ch["text"],
-                        "conversation_title": ch["conversation_title"],
-                        "roles": ch["roles"],
-                        "timestamp": ch["timestamp"],
-                        "message_ids": ch["message_ids"]
-                    }
+            self.client.get_collection(collection_name)
+            logger.info(f"Колекція '{collection_name}' вже існує")
+        except:
+            self.client.create_collection(
+                collection_name=collection_name,
+                vectors_config=VectorParams(
+                    size=self.vector_size,
+                    distance=Distance.COSINE
                 )
-                for j, (ch, emb) in enumerate(zip(batch, embeddings))
-            ]
-            self.client.upsert(collection_name=collection_name, points=points)
-        print(f"✅ {len(all_chunks)} чанків завантажено до Qdrant!")
-
-    def search(self, query: str, collection_name: str = None, top_k: int = 5):
-        collection_name = collection_name or self.collection_name
-        query_vector = self.model.encode(query).tolist()
-        results = self.client.search(collection_name=collection_name, query_vector=query_vector, limit=top_k)
+            )
+            logger.info(f"✅ Створено колекцію '{collection_name}'")
+    
+    def parse_chatgpt_export(self, filepath: str) -> List[Dict]:
+        """Парсинг експорту ChatGPT"""
+        logger.info(f"Парсинг файлу: {filepath}")
+        
+        with open(filepath, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        conversations = []
+        
+        for conv in data:
+            conv_id = conv.get('id', 'unknown')
+            title = conv.get('title', 'Без назви')
+            create_time = conv.get('create_time', 0)
+            
+            # Збираємо всі повідомлення
+            messages = []
+            mapping = conv.get('mapping', {})
+            
+            for node_id, node_data in mapping.items():
+                message_data = node_data.get('message')
+                if not message_data:
+                    continue
+                
+                author = message_data.get('author', {}).get('role', 'unknown')
+                content = message_data.get('content', {})
+                
+                if isinstance(content, dict):
+                    parts = content.get('parts', [])
+                    if parts and parts[0]:
+                        text = parts[0] if isinstance(parts[0], str) else str(parts[0])
+                        messages.append({
+                            'role': author,
+                            'content': text
+                        })
+            
+            if messages:
+                conversations.append({
+                    'id': conv_id,
+                    'title': title,
+                    'create_time': create_time,
+                    'messages': messages
+                })
+        
+        logger.info(f"✅ Знайдено {len(conversations)} розмов")
+        return conversations
+    
+    def create_chunks(self, conversations: List[Dict], chunk_size: int = 3) -> List[Dict]:
+        """Розбиття розмов на чанки"""
+        chunks = []
+        
+        for conv in conversations:
+            messages = conv['messages']
+            
+            # Розбиваємо по chunk_size повідомлень
+            for i in range(0, len(messages), chunk_size):
+                chunk_messages = messages[i:i + chunk_size]
+                
+                # Створюємо текст чанку
+                text_parts = []
+                for msg in chunk_messages:
+                    role = msg['role'].upper()
+                    content = msg['content']
+                    text_parts.append(f"{role}: {content}")
+                
+                chunk_text = "\n\n".join(text_parts)
+                
+                chunks.append({
+                    'conversation_id': conv['id'],
+                    'conversation_title': conv['title'],
+                    'text': chunk_text,
+                    'timestamp': datetime.fromtimestamp(conv['create_time']).isoformat(),
+                    'source': 'ChatGPT'
+                })
+        
+        logger.info(f"✅ Створено {len(chunks)} чанків")
+        return chunks
+    
+    def upload_to_qdrant(self, chunks: List[Dict], collection_name: str = "chatgpt_conversations"):
+        """Завантаження в Qdrant"""
+        self.ensure_collection(collection_name)
+        
+        logger.info(f"Завантаження {len(chunks)} чанків в '{collection_name}'...")
+        
+        # Генеруємо embeddings
+        texts = [chunk['text'] for chunk in chunks]
+        vectors = self.model.encode(texts, show_progress_bar=True)
+        
+        # Створюємо points
+        points = []
+        for i, (chunk, vector) in enumerate(zip(chunks, vectors)):
+            points.append(
+                PointStruct(
+                    id=i,
+                    vector=vector.tolist(),
+                    payload=chunk
+                )
+            )
+        
+        # Завантажуємо в Qdrant
+        self.client.upsert(
+            collection_name=collection_name,
+            points=points
+        )
+        
+        logger.info(f"✅ Завантажено {len(points)} points в Qdrant!")
+    
+    def load_from_file(self, filepath: str, collection_name: str = "chatgpt_conversations"):
+        """Повний цикл завантаження з файлу"""
+        logger.info("=" * 50)
+        logger.info("Початок завантаження в RAG")
+        
+        # Парсинг
+        conversations = self.parse_chatgpt_export(filepath)
+        
+        # Створення чанків
+        chunks = self.create_chunks(conversations)
+        
+        # Завантаження
+        self.upload_to_qdrant(chunks, collection_name)
+        
+        logger.info("=" * 50)
+    
+    def search(self, query: str, collection_name: str = "chatgpt_conversations", top_k: int = 5):
+        """Пошук в RAG базі"""
+        # Генеруємо вектор запиту
+        query_vector = self.model.encode([query])[0]
+        
+        # Шукаємо
+        results = self.client.search(
+            collection_name=collection_name,
+            query_vector=query_vector.tolist(),
+            limit=top_k
+        )
+        
         return results
-
-
-if __name__ == "__main__":
-    loader = ChatGPTToQdrant()
-    loader.load_to_qdrant("conversations.json")
-    results = loader.search("різниця між RAG серверами", top_k=3)
-    for i, r in enumerate(results, 1):
-        print(f"\n{i}. ({r.score:.4f}) {r.payload['conversation_title']}")
-        print(r.payload["text"][:200])
-
